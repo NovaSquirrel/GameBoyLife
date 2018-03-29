@@ -1,0 +1,2962 @@
+; Fast Conway's Life for Game Boy
+; Copyright (C) 2018 NovaSquirrel
+;
+; This program is free software: you can redistribute it and/or
+; modify it under the terms of the GNU General Public License as
+; published by the Free Software Foundation; either version 3 of the
+; License, or (at your option) any later version.
+;
+; This program is distributed in the hope that it will be useful, but
+; WITHOUT ANY WARRANTY; without even the implied warranty of
+; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+; General Public License for more details.
+;
+; You should have received a copy of the GNU General Public License
+; along with this program.  If not, see <http://www.gnu.org/licenses/>.
+;
+
+INCLUDE "gbhw.inc" 
+SECTION "vars", WRAM0
+oldgrid: ds 256 ; Last generation's grid, used for display and neighbor counting
+newgrid: ds 256 ; This generation's grid, workspace for the new grid
+ds 512          ; In 64x64 mode, the grid is 1024 bytes instead and newgrid is actually just 
+                ; more bytes for oldgrid. Instead, newgrid is replaced with newgrid64
+newgrid64: ds 1024
+sprites: ds 256 ; Sprite page, currently only used to initialize OAM to all zeros
+
+
+section "hram", HRAM[$FF80]
+run_dma:      ds 8 ; Copy of the OAM DMA routine in HRAM
+
+retraces:       db ; Frame count
+
+CursorX:        db ; X position of cursor, in cells
+CursorY:        db ; Y position of cursor, in cells
+MenuCursor:     db ; Y position of menu cursor
+MenuCount:      db ; number of menu options
+
+KeyDown:        db ; Keys pressed this frame
+KeyLast:        db ; Keys pressed last frame
+KeyNew:         db ; Keys pressed this frame that weren't last frame
+KeyRepeat:      db ; Timer for key repeat
+
+IsGameBoyColor: db ; $11 if Game Boy Color
+BigGrid:        db ; Nonzero if 64x64 mode on
+GridScrollX:    db
+GridScrollY:    db
+
+random1:        ds 2
+random2:        ds 2
+InitializedRandom: db ; Nonzero if random number generator has been seeded
+
+ColumnLoop:     db ; loop counter for grid calculation
+RowLoop:        db ; row counter for grid calculation
+
+SECTION "rom", ROM0
+
+; $0000 - $003F: RST handlers.
+ret
+REPT 7
+    nop
+ENDR
+; $0008
+ret
+REPT 7
+    nop
+ENDR
+; $0010
+ret
+REPT 7
+    nop
+ENDR
+; $0018
+ret
+REPT 7
+    nop
+ENDR
+; $0020
+ret
+REPT 7
+    nop
+ENDR
+; $0028
+ret
+REPT 7
+    nop
+ENDR
+; $0030
+ret
+REPT 7
+    nop
+ENDR
+; $0038
+ret
+REPT 7
+    nop
+ENDR
+
+; $0040 - $0067: Interrupt handlers.
+jp vblank
+REPT 5
+    nop
+ENDR
+; $0048
+jp stat
+REPT 5
+    nop
+ENDR
+; $0050
+jp timer
+REPT 5
+    nop
+ENDR
+; $0058
+jp serial
+REPT 5
+    nop
+ENDR
+; $0060
+jp joypad
+REPT 5
+    nop
+ENDR
+
+; $0068 - $00FF: Free space.
+DS $98
+
+; $0100 - $0103: Startup handler.
+nop
+jp Init
+
+; $0104 - $0133: The Nintendo Logo.
+DB $CE, $ED, $66, $66, $CC, $0D, $00, $0B
+DB $03, $73, $00, $83, $00, $0C, $00, $0D
+DB $00, $08, $11, $1F, $88, $89, $00, $0E
+DB $DC, $CC, $6E, $E6, $DD, $DD, $D9, $99
+DB $BB, $BB, $67, $63, $6E, $0E, $EC, $CC
+DB $DD, $DC, $99, $9F, $BB, $B9, $33, $3E
+
+; $0134 - $013E: The title, in upper-case letters, followed by zeroes.
+DB "LIFE"
+DS 7 ; padding
+
+; $013F - $0142: The manufacturer code.
+DS 4
+
+; $0143: Gameboy Color compatibility flag.    
+GBC_UNSUPPORTED EQU $00
+GBC_COMPATIBLE EQU $80
+GBC_EXCLUSIVE EQU $C0
+DB GBC_COMPATIBLE
+
+; $0144 - $0145: "New" Licensee Code, a two character name.
+DB "OK"
+
+; $0146: Super Gameboy compatibility flag.
+SGB_UNSUPPORTED EQU $00
+SGB_SUPPORTED EQU $03
+DB SGB_UNSUPPORTED
+
+; $0147: Cartridge type. Either no ROM or MBC5 is recommended.
+CART_ROM_ONLY EQU $00
+CART_MBC1 EQU $01
+CART_MBC1_RAM EQU $02
+CART_MBC1_RAM_BATTERY EQU $03
+CART_MBC2 EQU $05
+CART_MBC2_BATTERY EQU $06
+CART_ROM_RAM EQU $08
+CART_ROM_RAM_BATTERY EQU $09
+CART_MMM01 EQU $0B
+CART_MMM01_RAM EQU $0C
+CART_MMM01_RAM_BATTERY EQU $0D
+CART_MBC3_TIMER_BATTERY EQU $0F
+CART_MBC3_TIMER_RAM_BATTERY EQU $10
+CART_MBC3 EQU $11
+CART_MBC3_RAM EQU $12
+CART_MBC3_RAM_BATTERY EQU $13
+CART_MBC4 EQU $15
+CART_MBC4_RAM EQU $16
+CART_MBC4_RAM_BATTERY EQU $17
+CART_MBC5 EQU $19
+CART_MBC5_RAM EQU $1A
+CART_MBC5_RAM_BATTERY EQU $1B
+CART_MBC5_RUMBLE EQU $1C
+CART_MBC5_RUMBLE_RAM EQU $1D
+CART_MBC5_RUMBLE_RAM_BATTERY EQU $1E
+CART_POCKET_CAMERA EQU $FC
+CART_BANDAI_TAMA5 EQU $FD
+CART_HUC3 EQU $FE
+CART_HUC1_RAM_BATTERY EQU $FF
+DB CART_ROM_ONLY
+
+; $0148: Rom size.
+ROM_32K EQU $00
+ROM_64K EQU $01
+ROM_128K EQU $02
+ROM_256K EQU $03
+ROM_512K EQU $04
+ROM_1024K EQU $05
+ROM_2048K EQU $06
+ROM_4096K EQU $07
+ROM_1152K EQU $52
+ROM_1280K EQU $53
+ROM_1536K EQU $54
+DB ROM_32K
+
+; $0149: Ram size.
+RAM_NONE EQU $00
+RAM_2K EQU $01
+RAM_8K EQU $02
+RAM_32K EQU $03
+DB RAM_NONE
+
+; $014A: Destination code.
+DEST_JAPAN EQU $00
+DEST_INTERNATIONAL EQU $01
+DB DEST_INTERNATIONAL
+; $014B: Old licensee code.
+; $33 indicates new license code will be used.
+; $33 must be used for SGB games.
+DB $33
+; $014C: ROM version number
+DB $00
+; $014D: Header checksum.
+; Assembler needs to patch this.
+DB $FF
+; $014E- $014F: Global checksum.
+; Assembler needs to patch this.
+DW $FACE
+
+; $0150: Code!
+Init:
+  di				; Disable interrupts
+  ldh [IsGameBoyColor], a
+
+  ld   sp, $e000
+  call ScreenOff
+
+  ldh a, [IsGameBoyColor]
+  cp $11
+  call z, InitGameBoyColor
+
+; Set palettes and clear the scroll
+  ld a, %00011100
+  ldh [rOBP0], a
+  ld a, %01101100
+  ldh [rOBP1], a
+  ldh [rBGP], a
+  xor a
+  ldh [rSCX], a
+  ldh [rSCY], a
+  ldh [$FF26], a ; turn off sound
+
+; Clear first half of RAM
+  ld hl, WRAM_START
+  ld bc, 4096
+  call memclear
+
+; Copy in DMA routine
+  ld hl, oam_dma_routine
+  ld de, run_dma
+  ld bc, oam_dma_routine_end - oam_dma_routine
+  call memcpy
+
+; Upload graphics
+  ld hl, graphics
+  ld de, VRAM_LOW
+  ld bc, 2048
+  call memcpy
+; Clear the rest of VRAM
+  ld hl, VRAM_LOW+2048
+  ld bc, 8192-2048
+  call memclear
+
+; Initialize variables
+  ld a, 4
+  ldh [CursorX], a
+  ldh [CursorY], a
+  xor a
+  ldh [BigGrid], a
+  ldh [GridScrollX], a
+  ldh [GridScrollY], a
+  ldh [InitializedRandom], a
+
+  call InitBackground
+  call ScreenOn
+
+; Start the grid off with a glider
+  ld a, %0010
+  ld [oldgrid+$25], a
+  ld a, %0100
+  ld [oldgrid+$26], a
+  ld a, %0011
+  ld [oldgrid+$35], a
+  ld a, %0001
+  ld [oldgrid+$36], a
+
+  ; Erase all initial sprites
+  call wait_vblank
+  ld a, sprites>>8
+  call run_dma
+
+forever:
+  call UpdateGrid
+  call wait_vblank
+  call DisplayGrid
+
+  call readkeys
+
+  ldh a, [KeyDown]
+  bit 0, a ; A = edit
+  jp nz, edit_loop_start
+  bit 1, a ; B = open menu
+  jp nz, menu_start
+
+  jp forever
+
+edit_loop_start:
+  call wait_vblank
+
+  ldh a, [BigGrid]
+  or a
+  jp nz, edit_loop ; skip over if big mode
+  ld hl, StartForGo
+  ld de, SCREEN1+32*17+3+7
+  ld bc, 6
+  call memcpy
+
+edit_loop:
+  call readkeys
+  call DoKeyRepeat
+  ; Make it easier to draw lines
+  ld a, [KeyNew]
+  and KEY_LEFT | KEY_DOWN | KEY_UP | KEY_RIGHT
+  jr z, .notline
+  ld a, [KeyDown]
+  and KEY_A
+  jr z, .notline
+  ; Retrigger the toggle button
+  ld a, [KeyNew]
+  or KEY_A
+  ld [KeyNew], a
+.notline:
+
+  call wait_vblank
+  ld a, $10
+  ld [$fe02],a ; set tile number
+
+  ; Pick the appropriate edit loop
+  ldh a, [BigGrid]
+  or a
+  jr z, edit_loop_small
+  jp edit_loop_big
+
+MenuLoopReturn:
+
+  bit 2, b ; select
+  jr z, NotClear
+  call ClearGrid
+  call wait_vblank
+  call DisplayGrid
+NotClear:
+
+  bit 1, b ; B = open menu
+  jp nz, menu_start
+
+  bit 3, b ; Start = resume the simulation
+  jp z, edit_loop
+
+  call wait_vblank
+
+  ldh a, [BigGrid] ; don't draw text if using 64x64 mode
+  or a
+  jr nz, .no_a_for_edit
+  ld hl, AForEdit
+  ld de, SCREEN1+32*17+3+7
+  ld bc, 6
+  call memcpy
+.no_a_for_edit:
+
+  jp forever
+
+edit_loop_small: ; part of the edit loop, for 32x32
+  ; Draw the cursor sprite
+  ldh a, [CursorY]
+  add a ; * 4
+  add a
+  add (2*8)+8-2
+  ld [$fe00], a ; Y position
+
+  ldh a, [CursorX]
+  add a ; * 4
+  add a
+  add (1*8)+16-2
+  ld [$fe01], a ; X position
+
+  ; React to key inputs
+  ldh a, [KeyNew]
+  ld b, a
+
+  bit 7, b
+  jr z, .NotDown
+  ldh a, [CursorY]
+  inc a
+  and 31
+  ldh [CursorY], a
+.NotDown:
+
+  bit 6, b
+  jr z, .NotUp
+  ldh a, [CursorY]
+  dec a
+  and 31
+  ldh [CursorY], a
+.NotUp:
+
+  bit 5, b
+  jr z, .NotLeft
+  ldh a, [CursorX]
+  dec a
+  and 31
+  ldh [CursorX], a
+.NotLeft:
+
+  bit 4, b
+  jr z, .NotRight
+  ldh a, [CursorX]
+  inc a
+  and 31
+  ldh [CursorX], a
+.NotRight:
+
+  bit 0, b
+  jr z, .NotToggle
+  ; HL = Address for the byte the cursor is on
+  ld h, oldgrid>>8
+  ldh a, [CursorX]
+  ld l, a
+  srl l
+  ldh a, [CursorY]
+  add a
+  add a
+  add a
+  and $f0
+  or l
+  ld l, a
+
+  ; Shift to pick the right bit to toggle
+  ld c, 8
+
+  ldh a, [CursorX]
+  and 1
+  jr nz, .not_lsb_x
+  srl c
+.not_lsb_x:
+
+  ldh a, [CursorY]
+  and 1
+  jr nz, .not_lsb_y
+  srl c
+  srl c
+.not_lsb_y:
+
+  ; Toggle that bit
+  ld a, [hl]
+  xor c
+  ld [hl], a
+  push af ; keep the new byte for writing to the screen
+
+  ; Now display the changed grid
+  ; Calculate the nametable byte to change
+  ld h, 0
+  ldh a, [CursorY]
+  and %11110 ; Lose least significant bit
+  ld l, a
+  add hl, hl ; * 32
+  add hl, hl
+  add hl, hl
+  add hl, hl
+  ldh a, [CursorX]
+  srl a      ; Divide X cursor by 2
+  or l       ; OR it in
+  ld l, a
+ 
+;  ld b,b
+  ld de, SCREEN1+32*1+2
+  add hl, de
+
+  call wait_vblank
+  pop af
+  ld [hl], a
+.NotToggle:
+  jp MenuLoopReturn
+
+edit_loop_big:
+  ; Draw the cursor sprite
+  ldh a, [CursorY]
+  add a ; * 4
+  add a
+  add 16-2
+  ld [$fe00], a ; Y position
+
+  ldh a, [CursorX]
+  add a ; * 4
+  add a
+  add 8-2
+  ld [$fe01], a ; X position
+
+  ; React to key inputs
+  ldh a, [KeyNew]
+  ld b, a
+
+  bit 7, b
+  jr z, .NotDown
+  ldh a, [CursorY]
+  inc a
+  and 63
+  ldh [CursorY], a
+.NotDown:
+
+  bit 6, b
+  jr z, .NotUp
+  ldh a, [CursorY]
+  dec a
+  and 63
+  ldh [CursorY], a
+.NotUp:
+
+  bit 5, b
+  jr z, .NotLeft
+  ldh a, [CursorX]
+  dec a
+  and 63
+  ldh [CursorX], a
+.NotLeft:
+
+  bit 4, b
+  jr z, .NotRight
+  ldh a, [CursorX]
+  inc a
+  and 63
+  ldh [CursorX], a
+.NotRight:
+
+  bit 0, b
+  jr z, .NotToggle
+  ; HL = Address for the byte the cursor is on
+  ld h, 0
+  ldh a, [CursorY]
+  and %111110
+  ld l, a
+  add hl, hl ; * 64
+  add hl, hl
+  add hl, hl
+  add hl, hl
+  ldh a, [CursorX]
+  srl a
+  or l
+  ld l, a
+  ld de, oldgrid
+  add hl, de
+
+  ; Shift to pick the right bit to toggle
+  ld c, 8
+
+  ldh a, [CursorX]
+  and 1
+  jr nz, .not_lsb_x
+  srl c
+.not_lsb_x:
+
+  ldh a, [CursorY]
+  and 1
+  jr nz, .not_lsb_y
+  srl c
+  srl c
+.not_lsb_y:
+
+  ; Toggle that bit
+  ld a, [hl]
+  xor c
+  ld [hl], a
+  push af ; keep the new byte for writing to the screen
+
+  ; Now display the changed grid
+  ; Calculate the nametable byte to change
+  ld h, 0
+  ldh a, [CursorY]
+  and %111110 ; Lose least significant bit
+  ld l, a
+  add hl, hl ; * 32
+  add hl, hl
+  add hl, hl
+  add hl, hl
+  ldh a, [CursorX]
+  srl a      ; Divide X cursor by 2
+  or l       ; OR it in
+  ld l, a
+ 
+;  ld b,b
+  ld de, SCREEN1
+  add hl, de
+
+  call wait_vblank
+  pop af
+  ld [hl], a
+.NotToggle:
+  jp MenuLoopReturn
+
+; -----------------------------------------
+
+menu_start:
+  call ScreenOff
+  call ClearNametable
+
+  ld a, 3
+  ldh [MenuCount], a
+
+  ld hl, MenuTitle
+  ld de, SCREEN1+32*1+6
+  call strcpy
+  ld hl, MenuCredit1
+  ld de, SCREEN1+32*16+5
+  call strcpy
+  ld hl, MenuCredit2
+  ld de, SCREEN1+32*17+3
+  call strcpy
+
+  ld hl, MenuOptionBack
+  ld de, SCREEN1+32*3+3
+  call strcpy
+  ld hl, MenuOptionClear
+  ld de, SCREEN1+32*5+3
+  call strcpy
+  ld hl, MenuOptionRandom
+  ld de, SCREEN1+32*7+3
+  call strcpy
+
+  ldh a, [IsGameBoyColor]
+  cp $11
+  jr nz, .not_color
+  ld a, 5 ; for Game Boy color there are two additional options
+  ldh [MenuCount], a
+
+  ld hl, MenuOption6464
+  ldh a, [BigGrid] ; already big?
+  or a
+  jr z, .issmall
+  ld hl, MenuOption3232
+.issmall:
+
+  ld de, SCREEN1+32*9+3
+  call strcpy
+  ld hl, MenuOptionFast
+
+  ldh a, [$ff4d] ; check current speed
+  and 128        ; and display the other option if needed
+  jr z, .isslow
+  ld hl, MenuOptionSlow
+.isslow:  
+
+  ld de, SCREEN1+32*11+3
+  call strcpy
+.not_color:
+
+  call ScreenOn
+
+  xor a
+  ldh [MenuCursor], a
+
+menu_loop:
+  call readkeys
+  call DoKeyRepeat
+
+  call wait_vblank
+  ld a, ">"
+  ld [$fe02],a ; set tile number
+
+  ; Draw the cursor sprite
+  ldh a, [MenuCursor]
+  add a ; * 16
+  add a
+  add a
+  add a
+  add (2*8)+16+8
+  ld [$fe00], a ; Y position
+  ld a, 20
+  ld [$fe01], a ; X position
+
+  ; Respond to keys
+  ldh a, [KeyNew]  
+  ld b, a
+
+  bit 6, b
+  jr z, .not_up
+  ldh a, [MenuCursor]
+  dec a
+  bit 7, a
+  jr z, .not_up_wrap
+  ldh a, [MenuCount]
+  dec a
+.not_up_wrap:
+  ldh [MenuCursor], a
+.not_up:
+
+  bit 7, b
+  jr z, .not_down
+  ldh a, [MenuCount]
+  ld c, a
+
+  ldh a, [MenuCursor]
+  inc a
+  cp c
+  jr nz, .not_down_wrap
+  xor a
+.not_down_wrap:
+  
+  ldh [MenuCursor], a
+.not_down:
+
+  bit 0, b
+  jr z, .not_picked
+  ; Pick a menu item and launch its action
+  ld hl, MenuJumpTable
+  ld d, 0
+  ldh a, [MenuCursor]
+  add a
+  ld e, a
+  add hl, de
+  ; Load HL with [HL]
+  ld a,[hl]
+  inc hl
+  ld h,[hl]
+  ld l,a
+
+  jp hl
+.not_picked:
+
+
+  bit 1, b
+  jr nz, menu_exit
+  jp menu_loop
+
+menu_exit:
+  ; Redraw the background for actual "gameplay"
+  call ScreenOff
+  call InitBackground
+  ld hl, StartForGo
+  ld de, SCREEN1+32*17+3+7
+  ld bc, 6
+  call memcpy
+  call DisplayGrid
+  call ScreenOn
+
+  jp edit_loop_start
+
+MenuTitle:
+  db "- Menu -",0
+MenuOptionBack:
+  db "Back to editing",0
+MenuOptionClear:
+  db "Clear the grid",0
+MenuOptionRandom:
+  db "Randomize grid",0
+MenuOption6464:
+  db "64x64 grid",0
+MenuOption3232:
+  db "32x32 grid",0
+MenuOptionFast:
+  db "2x speed",0
+MenuOptionSlow:
+  db "1x speed",0
+MenuCredit1:
+  db "Programmed",0
+MenuCredit2:
+  db "by NovaSquirrel",0
+
+MenuJumpTable:
+  dw menu_exit
+  dw menu_clear_grid
+  dw menu_random_grid
+  dw menu_resize_grid
+  dw menu_speed_change
+
+menu_clear_grid:
+  call ClearGrid
+  jp menu_exit
+
+menu_random_grid:
+  ld hl, oldgrid
+
+  ld bc, 1024
+.loop:
+  call get_random_number
+  and 15
+  ld [hl+], a
+  ; decrement loop counter
+  dec bc
+  ld a, b
+  or c
+  jr nz, .loop
+
+  jp menu_exit
+
+
+menu_resize_grid:
+  xor a
+  ldh [GridScrollX],a
+  ldh [GridScrollY],a
+
+  ldh a, [BigGrid]
+  xor 1
+  ldh [BigGrid], a
+
+  jp menu_exit
+
+menu_speed_change:
+  ; Speed toggle sequence
+  xor a
+  ldh [$ffff], a
+  ld a, $30
+  ldh [$ff00], a
+  ld a, $01
+  ldh [$ff4d], a
+  stop
+  jp menu_exit
+
+get_random_number:
+  ; Adapted from the random number generator used in Nova the Squirrel
+  ; http://codebase64.org/doku.php?id=base:two_very_fast_16bit_pseudo_random_generators_as_lfsr
+  ldh a, [InitializedRandom]
+  or a
+  jr nz, .already
+  ldh a, [retraces]
+  ld [random1+0], a
+  inc a
+  ld [random1+1], a
+  inc a
+  ld [random2+0], a
+  inc a
+  ld [random2+1], a
+  ld a, 1
+  ld [InitializedRandom], a
+.already:
+
+  push bc
+  push de
+  lda b, [random1+0]
+  lda c, [random1+1]
+  lda d, [random2+0]
+  lda e, [random2+1]
+  ; LFSR 1
+  ld a,c
+  add a
+  add a
+  xor c
+  add a
+  xor c
+  add a
+  add a
+  xor c
+  add a
+  rl b         ;shift this left, "random" bit comes from low
+  rl c
+  ; LFSR 2
+  ld a, e
+  add a
+  xor e
+  add a
+  add a
+  rr d         ;shift this right, random bit comes from high - nicer when eor with random1
+  rl e
+  lda [random1+0], b
+  lda [random1+1], c
+  lda [random2+0], d
+  lda [random2+1], e
+  ld a, b
+  xor d
+  pop de
+  pop bc
+
+  ret
+
+; -----------------------------------------
+
+InitGameBoyColor:
+  xor a
+  ldh [$FF4F], a ; VRAM bank
+  ld a, 1
+  ldh [$FF70], a ; WRAM bank
+
+  ld a, $80      ; index zero, auto increment
+  ldh [$ff68], a ; background palette index
+  ld hl, BG_Palette
+  ld b, 2*4
+.loop:
+  ld a, [hl+]
+  ld [$ff69], a
+  dec b
+  jr nz, .loop
+
+; Now for sprites
+  ld a, $80      ; index zero, auto increment
+  ldh [$ff6a], a ; background palette index
+  ld hl, Sprite_Palette
+  ld b, 2*4
+.loop2:
+  ld a, [hl+]
+  ld [$ff6b], a
+  dec b
+  jr nz, .loop2
+  ret
+
+RGB_Color: MACRO
+  dw \1 | (\2<<5) | (\3<<10)
+ENDM
+
+BG_Palette:
+; Background palette
+  RGB_Color 31, 31, 31
+  RGB_Color  0,  0,  0
+  RGB_Color 13, 13, 13
+  RGB_Color 22, 22, 22
+Sprite_Palette
+; Sprite palette
+  RGB_Color 31, 24, 24
+  RGB_Color 31, 12, 12
+  RGB_Color 12,  0,  0
+  RGB_Color 24,  0,  0
+; -----------------------------------------
+
+ScreenOff:
+  call wait_vblank
+  xor a
+  ldh [rLCDC], a
+  ret
+
+ScreenOn:
+  ld a, LCDCF_ON|LCDCF_OBJ8|LCDCF_OBJON|LCDCF_BGON|LCDCF_BG8000
+  ldh [rLCDC],a
+  ret
+
+; -----------------------------------------
+
+DisplayGrid:
+  ; Hide first sprite
+  xor a
+  ld [$fe00], a
+  ; Also reset scrolling
+  ldh [rSCX], a
+  ldh [rSCY], a
+
+  ldh a, [BigGrid]
+  or a
+  jp nz, DisplayBigGrid
+
+  ; ----------------------------------------------------
+  ; Copy the grid to the screen
+  ld hl, SCREEN1+32*1+2
+  ld de, oldgrid
+
+  ld b, 16 ; 16 rows
+.rowloop:
+  ld c, 8  ; 16 columns, 2 per loop iteration
+.waitVRAM:
+  ldh a, [rSTAT]
+  and STATF_BUSY
+  jr nz, .waitVRAM
+
+  ; Do two updates
+  ld a, [de]
+  ld [hl+], a
+  inc e
+  ld a, [de]
+  ld [hl+], a
+  inc e
+
+  dec c
+  jr nz, .waitVRAM
+
+  ld a, l
+  add 16
+  ld l, a
+  ld a, h
+  adc 0
+  ld h, a
+
+  dec b
+  jr nz, .rowloop
+  ret
+
+DisplayBigGrid:
+  ldh a, [GridScrollX]
+  ldh [rSCX], a
+  ldh a, [GridScrollY]
+  ldh [rSCY], a
+
+  ld hl, $ff51
+  ld a, oldgrid>>8  ; DMA source, high
+  ld [hl+], a
+  xor a             ; DMA source, low
+  ld [hl+], a
+  ld a, SCREEN1 >> 8  ; DMA destination, high
+  ld [hl+], a
+  ld a, SCREEN1 & 255 ; DMA destination, low
+  ld [hl+], a
+  ld a, (1024/16-1)|128 ; DMA size, and HDMA mode on
+  ld [hl], a
+
+  ; HL is still $ff55, wait for most significant bit to clear
+.wait:
+  ld a, [hl]
+  rla
+  jr c, .wait
+
+  ret
+
+ClearGrid:
+  push bc
+  ld hl, oldgrid
+;  ld bc, 256
+  ld bc, 1024 ; clear all 1024 even if not on 64x64 mode
+  call memclear
+  pop bc
+  ret
+
+InitBackground:
+  call ClearNametable
+  ldh a, [BigGrid] ; don't draw text if using 64x64 mode
+  or a
+  ret nz
+
+; Write "Conway's Life" at the top
+  ld hl, TitleText
+  ld de, SCREEN1+32*0+3
+  ld bc, 13
+  call memcpy
+
+; And offer the menu at the bottom
+  ld hl, BForMenu
+  ld de, SCREEN1+32*17+3
+  ld bc, 13
+  jp memcpy
+  
+ClearNametable:
+; Initialize nametable
+  ld hl, SCREEN1
+  ld bc, 1024
+  ld e, " "
+  jp memset
+
+vblank:
+  push af
+  ld a, [retraces]
+  inc a
+  ld [retraces], a
+  pop af
+  reti
+
+wait_vblank:
+  push hl
+  push af
+  ld a, %00001
+  ldh [$FFFF],a     ; Enable vblank interrupt
+  ei
+
+  ld   hl, retraces
+  ld   a, [hl]
+.loop:
+  halt
+  cp   a, [hl]
+  jr   z, .loop
+  pop af
+  pop hl
+  ret
+
+stat:
+timer:
+serial:
+joypad:
+  reti
+
+memclear:
+  xor a
+  ldi [hl], a
+  dec bc
+  ld a,b
+  or c
+  jr nz, memclear
+  ret
+
+memset:
+  ld [hl], e
+  inc hl
+  dec bc
+  ld a,b
+  or c
+  jr nz, memset
+  ret
+
+memcpy:
+  ldi a, [hl]
+  ld [de], a
+  inc de
+  dec bc
+  ld a,b
+  or c
+  jr nz, memcpy
+  ret
+
+strcpy:
+  ldi a, [hl]
+  or a
+  ret z
+  ld [de], a
+  inc de
+  jr strcpy
+  ret
+
+
+oam_dma_routine:
+  ldh [rDMA],a
+  ld  a,$28
+.wait:
+  dec a
+  jr  nz,.wait
+  ret
+oam_dma_routine_end:
+
+readkeys:
+  ld a, [KeyDown]
+  ld [KeyLast], a
+
+  ld a, KEY_BUTTONS
+  ldh [rKEYS], a
+  ldh a, [rKEYS]
+  ldh a, [rKEYS]
+  ldh a, [rKEYS]
+  ldh a, [rKEYS]
+  ldh a, [rKEYS]
+  ldh a, [rKEYS]
+  ldh a, [rKEYS]
+  ldh a, [rKEYS]
+  and $f
+  ld b, a
+
+  ld a, KEY_DIRECTION
+  ldh [rKEYS], a
+  ldh a, [rKEYS]
+  ldh a, [rKEYS]
+  ldh a, [rKEYS]
+  ldh a, [rKEYS]
+  ldh a, [rKEYS]
+  ldh a, [rKEYS]
+  ldh a, [rKEYS]
+  ldh a, [rKEYS]
+  and $f
+  swap a
+  or b
+  cpl
+  ld [KeyDown], a
+
+  ld a, [KeyLast]
+  cpl
+  ld b, a
+  ld a, [KeyDown]
+  and b
+  ld [KeyNew], a
+  ret
+
+DoKeyRepeat:
+  ; Apply key repeat
+  ld a, [KeyDown]
+  and KEY_LEFT | KEY_DOWN | KEY_UP | KEY_RIGHT
+  ld b, a
+  ld a, [KeyLast]
+  and KEY_LEFT | KEY_DOWN | KEY_UP | KEY_RIGHT
+  cp b
+  jr nz, .stop_repeat
+
+  ld a, [KeyRepeat] ; Delay before auto-repeat
+  cp 16
+  jr nz, .no_repeat_yet
+  ld a, [retraces]  ; Only repeat every 4 frames
+  and 3
+  ret nz
+
+  ; Get the d-pad only
+  ld a, [KeyDown]
+  and KEY_LEFT | KEY_DOWN | KEY_UP | KEY_RIGHT
+  ld b, a
+  ; repeat those directions
+  ld a, [KeyNew]
+  or b
+  ld [KeyNew], a
+
+  jr .did_repeat
+.no_repeat_yet:
+  ld a, [KeyRepeat]
+  inc a
+  ld [KeyRepeat], a
+  ret
+.stop_repeat:
+  xor a
+  ld [KeyRepeat],a
+.did_repeat:
+  ret
+
+TitleText:
+  db "Conway's Life"
+BForMenu:
+  db $11, " Menu "
+AForEdit:
+  db $12, " Edit"
+StartForGo:
+  db $13, $14, $15, " Go"
+
+graphics:
+INCBIN "graphics.chr"
+
+; ----------------------------------------------------------------------
+; 32x32 GRID CALCULATION STARTS HERE
+; ----------------------------------------------------------------------
+
+TOP_LEFT  equ 0
+TOP_RIGHT equ 1
+BOT_LEFT  equ 2
+BOT_RIGHT equ 3
+
+lsub: MACRO
+  ld a, l
+  sub \1
+  ld l,a
+ENDM
+
+ladd: MACRO
+  ld a, l
+  add \1
+  ld l,a
+ENDM
+
+lleft: MACRO ; jump to the left of a 32x32 grid
+  ld a, l
+  and $f0
+  ld l, a
+ENDM
+
+lright: MACRO ; jump to the right of a 32x32 grid
+  ld a, l
+  or $0f
+  ld l, a
+ENDM
+
+lleft64: MACRO ; jump to the left of a 64x64 grid
+  ld a, l
+  and $e0
+  ld l, a
+ENDM
+
+lright64: MACRO ; jump to the right of a 64x64 grid
+  ld a, l
+  or $1f
+  ld l, a
+ENDM
+
+addneighbor: MACRO
+  if \1 == TOP_LEFT
+    ; TOP_LEFT must be last
+    and 1
+    add a,c
+    ld c,a
+  ELSE
+    bit \1, a
+    jr z, no\@
+    inc c
+no\@:
+  ENDC
+ENDM
+
+updatecell: MACRO
+  ld a, c        ; get neighbor count
+  cp 3           ; if it's 3, it's on no matter what
+  jr z, three\@ 
+  cp 2           ; if it's 2, it's only on if the old cell is 1
+  jr nz, skip\@
+  bit \1, [hl]   ; check old cell
+  jr z, skip\@   ; not on, don't set in the new one
+three\@:
+  set \1, b      ; turn the cell on
+skip\@:
+ENDM
+
+writecell: MACRO
+  ld a, b
+  ld [de], a
+  inc e
+  inc l
+ENDM
+
+UpdateCellRegular:
+; new cell
+  ld b, 0
+
+; find neighbors (top left)
+  ld c, b
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  lsub 16
+  ld a, [hl+]
+  addneighbor BOT_RIGHT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 16
+  updatecell TOP_LEFT
+
+; find neighbors (top right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lsub 16
+  ld a, [hl-]
+  addneighbor BOT_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 16
+  updatecell TOP_RIGHT
+
+; find neighbors (bottom left)
+  ld c, 0
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  ladd 16
+  ld a, [hl+]
+  addneighbor TOP_RIGHT
+  ld a, [hl]
+  addneighbor TOP_RIGHT  
+  addneighbor TOP_LEFT  
+  lsub 16 
+  updatecell BOT_LEFT
+
+; find neighbors (bottom right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ladd 16
+  ld a, [hl-]
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor TOP_LEFT
+  lsub 16
+  updatecell BOT_RIGHT
+
+  writecell
+
+  ldh a, [ColumnLoop]
+  dec a
+  ldh [ColumnLoop], a
+  jp nz, UpdateCellRegular
+  ret
+
+UpdateCellLeftEdge:
+; new cell
+  ld b, 0
+
+; find neighbors (top left)
+  ld c, b
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  lright
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  lsub 16
+  ld a, [hl]
+  addneighbor BOT_RIGHT
+  lleft
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 16
+  updatecell TOP_LEFT
+
+; find neighbors (top right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lsub 16
+  ld a, [hl-]
+  addneighbor BOT_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 16
+  updatecell TOP_RIGHT
+
+; find neighbors (bottom left)
+  ld c, 0
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  lright
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  ladd 16
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  lleft
+  ld a, [hl]
+  addneighbor TOP_RIGHT  
+  addneighbor TOP_LEFT  
+  lsub 16 
+  updatecell BOT_LEFT
+
+; find neighbors (bottom right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ladd 16
+  ld a, [hl-]
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor TOP_LEFT
+  lsub 16
+  updatecell BOT_RIGHT
+
+  writecell
+  ret
+
+UpdateCellRightEdge:
+; new cell
+  ld b, 0
+
+; find neighbors (top left)
+  ld c, b
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  lsub 16
+  ld a, [hl+]
+  addneighbor BOT_RIGHT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 16
+  updatecell TOP_LEFT
+
+; find neighbors (top right)
+  ld c, 0
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  lleft
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lsub 16
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  lright
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 16
+  updatecell TOP_RIGHT
+
+; find neighbors (bottom left)
+  ld c, 0
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  ladd 16
+  ld a, [hl+]
+  addneighbor TOP_RIGHT
+  ld a, [hl]
+  addneighbor TOP_RIGHT  
+  addneighbor TOP_LEFT  
+  lsub 16 
+  updatecell BOT_LEFT
+
+; find neighbors (bottom right)
+  ld c, 0
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lleft
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ladd 16
+  ld a, [hl]
+  addneighbor TOP_LEFT
+  lright
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor TOP_LEFT
+  lsub 16
+  updatecell BOT_RIGHT
+
+  writecell
+  ret
+
+
+UpdateGrid:
+  ldh a, [BigGrid]
+  or a
+  jp nz, UpdateGrid64
+
+  ld hl, oldgrid
+  ld de, newgrid
+.runloop:
+  call UpdateCellLeftEdge
+  ld a, 14
+  ldh [ColumnLoop], a
+  call UpdateCellRegular
+  call UpdateCellRightEdge
+  ; Last instruction is "inc l"
+  jr nz, .runloop
+
+; Copy over the old grid with the new one
+  ld hl, newgrid
+  ld de, oldgrid
+.copyloop
+  ld a, [hl+]
+  ld [de], a
+  inc e
+  jr nz, .copyloop
+  ret
+
+; ----------------------------------------------------------------------
+; 64x64 GRID CALCULATION STARTS HERE
+; ----------------------------------------------------------------------
+
+UpdateCellLeftEdge64:
+; new cell
+  ld b, 0
+
+; find neighbors (top left)
+  ld c, b
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  lright64
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  lsub 32
+  ld a, [hl]
+  addneighbor BOT_RIGHT
+  lleft64
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  updatecell TOP_LEFT
+
+; find neighbors (top right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lsub 32
+  ld a, [hl-]
+  addneighbor BOT_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  updatecell TOP_RIGHT
+
+; find neighbors (bottom left)
+  ld c, 0
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  lright64
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  ladd 32
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  lleft64
+  ld a, [hl]
+  addneighbor TOP_RIGHT  
+  addneighbor TOP_LEFT  
+  lsub 32 
+  updatecell BOT_LEFT
+
+; find neighbors (bottom right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ladd 32
+  ld a, [hl-]
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor TOP_LEFT
+  lsub 32
+  updatecell BOT_RIGHT
+
+  writecell
+  ret
+
+UpdateCellRightEdge64:
+; new cell
+  ld b, 0
+
+; find neighbors (top left)
+  ld c, b
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  lsub 32
+  ld a, [hl+]
+  addneighbor BOT_RIGHT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  updatecell TOP_LEFT
+
+; find neighbors (top right)
+  ld c, 0
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  lleft64
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lsub 32
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  lright64
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  updatecell TOP_RIGHT
+
+; find neighbors (bottom left)
+  ld c, 0
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  ladd 32
+  ld a, [hl+]
+  addneighbor TOP_RIGHT
+  ld a, [hl]
+  addneighbor TOP_RIGHT  
+  addneighbor TOP_LEFT  
+  lsub 32 
+  updatecell BOT_LEFT
+
+; find neighbors (bottom right)
+  ld c, 0
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lleft64
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ladd 32
+  ld a, [hl]
+  addneighbor TOP_LEFT
+  lright64
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor TOP_LEFT
+  lsub 32
+  updatecell BOT_RIGHT
+
+  writecell
+  ret
+
+UpdateCellRegular64:
+; new cell
+  ld b, 0
+
+; find neighbors (top left)
+  ld c, b
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  lsub 32
+  ld a, [hl+]
+  addneighbor BOT_RIGHT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  updatecell TOP_LEFT
+
+; find neighbors (top right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lsub 32
+  ld a, [hl-]
+  addneighbor BOT_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  updatecell TOP_RIGHT
+
+; find neighbors (bottom left)
+  ld c, 0
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  ladd 32
+  ld a, [hl+]
+  addneighbor TOP_RIGHT
+  ld a, [hl]
+  addneighbor TOP_RIGHT  
+  addneighbor TOP_LEFT  
+  lsub 32 
+  updatecell BOT_LEFT
+
+; find neighbors (bottom right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ladd 32
+  ld a, [hl-]
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor TOP_LEFT
+  lsub 32
+  updatecell BOT_RIGHT
+
+  writecell
+  ldh a, [ColumnLoop]
+  dec a
+  ldh [ColumnLoop], a
+  jp nz, UpdateCellRegular64
+  ret
+
+; ----------------------------------------------------------------------
+
+UpdateCellLeftEdge64Top:
+; new cell
+  ld b, 0
+
+; find neighbors (top left)
+  ld c, b
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  lright64
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  lsub 32
+  dec h
+  ld a, [hl]
+  addneighbor BOT_RIGHT
+  lleft64
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  inc h
+  updatecell TOP_LEFT
+
+; find neighbors (top right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lsub 32
+  dec h
+  ld a, [hl-]
+  addneighbor BOT_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  inc h
+  updatecell TOP_RIGHT
+
+; find neighbors (bottom left)
+  ld c, 0
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  lright64
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  ladd 32
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  lleft64
+  ld a, [hl]
+  addneighbor TOP_RIGHT  
+  addneighbor TOP_LEFT  
+  lsub 32
+  updatecell BOT_LEFT
+
+; find neighbors (bottom right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ladd 32
+  ld a, [hl-]
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor TOP_LEFT
+  lsub 32
+  updatecell BOT_RIGHT
+
+  writecell
+  ret
+
+UpdateCellRightEdge64Top:
+; new cell
+  ld b, 0
+
+; find neighbors (top left)
+  ld c, b
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  lsub 32
+  dec h
+  ld a, [hl+]
+  addneighbor BOT_RIGHT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  inc h
+  updatecell TOP_LEFT
+
+; find neighbors (top right)
+  ld c, 0
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  lleft64
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lsub 32
+  dec h
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  lright64
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  inc h
+  updatecell TOP_RIGHT
+
+; find neighbors (bottom left)
+  ld c, 0
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  ladd 32
+  ld a, [hl+]
+  addneighbor TOP_RIGHT
+  ld a, [hl]
+  addneighbor TOP_RIGHT  
+  addneighbor TOP_LEFT  
+  lsub 32 
+  updatecell BOT_LEFT
+
+; find neighbors (bottom right)
+  ld c, 0
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lleft64
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ladd 32
+  ld a, [hl]
+  addneighbor TOP_LEFT
+  lright64
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor TOP_LEFT
+  lsub 32
+  updatecell BOT_RIGHT
+
+  writecell
+  ret
+
+UpdateCellRegular64Top:
+; new cell
+  ld b, 0
+
+; find neighbors (top left)
+  ld c, b
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  lsub 32
+  dec h
+  ld a, [hl+]
+  addneighbor BOT_RIGHT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  inc h
+  updatecell TOP_LEFT
+
+; find neighbors (top right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lsub 32
+  dec h
+  ld a, [hl-]
+  addneighbor BOT_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  inc h
+  updatecell TOP_RIGHT
+
+; find neighbors (bottom left)
+  ld c, 0
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  ladd 32
+  ld a, [hl+]
+  addneighbor TOP_RIGHT
+  ld a, [hl]
+  addneighbor TOP_RIGHT  
+  addneighbor TOP_LEFT  
+  lsub 32 
+  updatecell BOT_LEFT
+
+; find neighbors (bottom right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ladd 32
+  ld a, [hl-]
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor TOP_LEFT
+  lsub 32
+  updatecell BOT_RIGHT
+
+  writecell
+  ldh a, [ColumnLoop]
+  dec a
+  ldh [ColumnLoop], a
+  jp nz, UpdateCellRegular64Top
+  ret
+
+; ----------------------------------------------------------------------
+
+UpdateCellLeftEdge64Bottom:
+; new cell
+  ld b, 0
+
+; find neighbors (top left)
+  ld c, b
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  lright64
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  lsub 32
+  ld a, [hl]
+  addneighbor BOT_RIGHT
+  lleft64
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  updatecell TOP_LEFT
+
+; find neighbors (top right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lsub 32
+  ld a, [hl-]
+  addneighbor BOT_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  updatecell TOP_RIGHT
+
+; find neighbors (bottom left)
+  ld c, 0
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  lright64
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  ladd 32
+  inc h
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  lleft64
+  ld a, [hl]
+  addneighbor TOP_RIGHT  
+  addneighbor TOP_LEFT  
+  lsub 32 
+  dec h
+  updatecell BOT_LEFT
+
+; find neighbors (bottom right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ladd 32
+  inc h
+  ld a, [hl-]
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor TOP_LEFT
+  lsub 32
+  dec h
+  updatecell BOT_RIGHT
+
+  writecell
+  ret
+
+UpdateCellRightEdge64Bottom:
+; new cell
+  ld b, 0
+
+; find neighbors (top left)
+  ld c, b
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  lsub 32
+  ld a, [hl+]
+  addneighbor BOT_RIGHT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  updatecell TOP_LEFT
+
+; find neighbors (top right)
+  ld c, 0
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  lleft64
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lsub 32
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  lright64
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  updatecell TOP_RIGHT
+
+; find neighbors (bottom left)
+  ld c, 0
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  ladd 32
+  inc h
+  ld a, [hl+]
+  addneighbor TOP_RIGHT
+  ld a, [hl]
+  addneighbor TOP_RIGHT  
+  addneighbor TOP_LEFT  
+  lsub 32 
+  dec h
+  updatecell BOT_LEFT
+
+; find neighbors (bottom right)
+  ld c, 0
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lleft64
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ladd 32
+  inc h
+  ld a, [hl]
+  addneighbor TOP_LEFT
+  lright64
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor TOP_LEFT
+  lsub 32
+  dec h
+  updatecell BOT_RIGHT
+
+  writecell
+  ret
+
+UpdateCellRegular64Bottom:
+; new cell
+  ld b, 0
+
+; find neighbors (top left)
+  ld c, b
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  lsub 32
+  ld a, [hl+]
+  addneighbor BOT_RIGHT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  updatecell TOP_LEFT
+
+; find neighbors (top right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lsub 32
+  ld a, [hl-]
+  addneighbor BOT_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  updatecell TOP_RIGHT
+
+; find neighbors (bottom left)
+  ld c, 0
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  ladd 32
+  inc h
+  ld a, [hl+]
+  addneighbor TOP_RIGHT
+  ld a, [hl]
+  addneighbor TOP_RIGHT  
+  addneighbor TOP_LEFT  
+  lsub 32 
+  dec h
+  updatecell BOT_LEFT
+
+; find neighbors (bottom right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ladd 32
+  inc h
+  ld a, [hl-]
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor TOP_LEFT
+  lsub 32
+  dec h
+  updatecell BOT_RIGHT
+
+  writecell
+  ldh a, [ColumnLoop]
+  dec a
+  ldh [ColumnLoop], a
+  jp nz, UpdateCellRegular64Bottom
+  ret
+
+; ----------------------------------------------------------------------
+
+UpdateCellLeftEdge64VeryTop:
+; new cell
+  ld b, 0
+
+; find neighbors (top left)
+  ld c, b
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  lright64
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  lsub 32
+  ld h, (oldgrid+256*3) >> 8
+  ld a, [hl]
+  addneighbor BOT_RIGHT
+  lleft64
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  ld h, (oldgrid+256*0) >> 8
+  updatecell TOP_LEFT
+
+; find neighbors (top right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lsub 32
+  ld h, (oldgrid+256*3) >> 8
+  ld a, [hl-]
+  addneighbor BOT_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  ld h, (oldgrid+256*0) >> 8
+  updatecell TOP_RIGHT
+
+; find neighbors (bottom left)
+  ld c, 0
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  lright64
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  ladd 32
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  lleft64
+  ld a, [hl]
+  addneighbor TOP_RIGHT  
+  addneighbor TOP_LEFT  
+  lsub 32 
+  updatecell BOT_LEFT
+
+; find neighbors (bottom right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ladd 32
+  ld a, [hl-]
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor TOP_LEFT
+  lsub 32
+  updatecell BOT_RIGHT
+
+  writecell
+  ret
+
+UpdateCellRightEdge64VeryTop:
+; new cell
+  ld b, 0
+
+; find neighbors (top left)
+  ld c, b
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  lsub 32
+  ld h, (oldgrid+256*3) >> 8
+  ld a, [hl+]
+  addneighbor BOT_RIGHT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  ld h, (oldgrid+256*0) >> 8
+  updatecell TOP_LEFT
+
+; find neighbors (top right)
+  ld c, 0
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  lleft64
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lsub 32
+  ld h, (oldgrid+256*3) >> 8
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  lright64
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  ld h, (oldgrid+256*0) >> 8
+  updatecell TOP_RIGHT
+
+; find neighbors (bottom left)
+  ld c, 0
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  ladd 32
+  ld a, [hl+]
+  addneighbor TOP_RIGHT
+  ld a, [hl]
+  addneighbor TOP_RIGHT  
+  addneighbor TOP_LEFT  
+  lsub 32 
+  updatecell BOT_LEFT
+
+; find neighbors (bottom right)
+  ld c, 0
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lleft64
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ladd 32
+  ld a, [hl]
+  addneighbor TOP_LEFT
+  lright64
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor TOP_LEFT
+  lsub 32
+  updatecell BOT_RIGHT
+
+  writecell
+  ret
+
+UpdateCellRegular64VeryTop:
+; new cell
+  ld b, 0
+
+; find neighbors (top left)
+  ld c, b
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  lsub 32
+  ld h, (oldgrid+256*3) >> 8
+  ld a, [hl+]
+  addneighbor BOT_RIGHT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  ld h, (oldgrid+256*0) >> 8
+  updatecell TOP_LEFT
+
+; find neighbors (top right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lsub 32
+  ld h, (oldgrid+256*3) >> 8
+  ld a, [hl-]
+  addneighbor BOT_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  ld h, (oldgrid+256*0) >> 8
+  updatecell TOP_RIGHT
+
+; find neighbors (bottom left)
+  ld c, 0
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  ladd 32
+  ld a, [hl+]
+  addneighbor TOP_RIGHT
+  ld a, [hl]
+  addneighbor TOP_RIGHT  
+  addneighbor TOP_LEFT  
+  lsub 32 
+  updatecell BOT_LEFT
+
+; find neighbors (bottom right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ladd 32
+  ld a, [hl-]
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor TOP_LEFT
+  lsub 32
+  updatecell BOT_RIGHT
+
+  writecell
+  ldh a, [ColumnLoop]
+  dec a
+  ldh [ColumnLoop], a
+  jp nz, UpdateCellRegular64VeryTop
+  ret
+
+; ----------------------------------------------------------------------
+
+UpdateCellLeftEdge64VeryBottom:
+; new cell
+  ld b, 0
+
+; find neighbors (top left)
+  ld c, b
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  lright64
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  lsub 32
+  ld a, [hl]
+  addneighbor BOT_RIGHT
+  lleft64
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  updatecell TOP_LEFT
+
+; find neighbors (top right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lsub 32
+  ld a, [hl-]
+  addneighbor BOT_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  updatecell TOP_RIGHT
+
+; find neighbors (bottom left)
+  ld c, 0
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  lright64
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  ladd 32
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  lleft64
+  ld h, (oldgrid+256*0) >> 8
+  ld a, [hl]
+  addneighbor TOP_RIGHT  
+  addneighbor TOP_LEFT  
+  lsub 32 
+  ld h, (oldgrid+256*3) >> 8
+  updatecell BOT_LEFT
+
+; find neighbors (bottom right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ladd 32
+  ld h, (oldgrid+256*0) >> 8
+  ld a, [hl-]
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor TOP_LEFT
+  lsub 32
+  ld h, (oldgrid+256*3) >> 8
+  updatecell BOT_RIGHT
+
+  writecell
+  ret
+
+UpdateCellRightEdge64VeryBottom:
+; new cell
+  ld b, 0
+
+; find neighbors (top left)
+  ld c, b
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  lsub 32
+  ld a, [hl+]
+  addneighbor BOT_RIGHT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  updatecell TOP_LEFT
+
+; find neighbors (top right)
+  ld c, 0
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  lleft64
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lsub 32
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  lright64
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  updatecell TOP_RIGHT
+
+; find neighbors (bottom left)
+  ld c, 0
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  ladd 32
+  ld h, (oldgrid+256*0) >> 8
+  ld a, [hl+]
+  addneighbor TOP_RIGHT
+  ld a, [hl]
+  addneighbor TOP_RIGHT  
+  addneighbor TOP_LEFT  
+  lsub 32
+  ld h, (oldgrid+256*3) >> 8
+  updatecell BOT_LEFT
+
+; find neighbors (bottom right)
+  ld c, 0
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lleft64
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ladd 32
+  ld h, (oldgrid+256*0) >> 8
+  ld a, [hl]
+  addneighbor TOP_LEFT
+  lright64
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor TOP_LEFT
+  lsub 32
+  ld h, (oldgrid+256*3) >> 8
+  updatecell BOT_RIGHT
+
+  writecell
+  ret
+
+UpdateCellRegular64VeryBottom:
+; new cell
+  ld b, 0
+
+; find neighbors (top left)
+  ld c, b
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ld a,[hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  lsub 32
+  ld a, [hl+]
+  addneighbor BOT_RIGHT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  updatecell TOP_LEFT
+
+; find neighbors (top right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a,[hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  lsub 32
+  ld a, [hl-]
+  addneighbor BOT_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor BOT_RIGHT
+  ladd 32
+  updatecell TOP_RIGHT
+
+; find neighbors (bottom left)
+  ld c, 0
+  ld a,[hl-]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_RIGHT
+  ladd 32
+  ld h, (oldgrid+256*0) >> 8
+  ld a, [hl+]
+  addneighbor TOP_RIGHT
+  ld a, [hl]
+  addneighbor TOP_RIGHT  
+  addneighbor TOP_LEFT  
+  lsub 32
+  ld h, (oldgrid+256*3) >> 8
+  updatecell BOT_LEFT
+
+; find neighbors (bottom right)
+  ld c, 0
+  ld a,[hl+]
+  addneighbor TOP_RIGHT
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor BOT_LEFT
+  addneighbor TOP_LEFT
+  ladd 32
+  ld h, (oldgrid+256*0) >> 8
+  ld a, [hl-]
+  addneighbor TOP_LEFT
+  ld a, [hl]
+  addneighbor TOP_RIGHT
+  addneighbor TOP_LEFT
+  lsub 32
+  ld h, (oldgrid+256*3) >> 8
+  updatecell BOT_RIGHT
+
+  writecell
+  ldh a, [ColumnLoop]
+  dec a
+  ldh [ColumnLoop], a
+  jp nz, UpdateCellRegular64VeryBottom
+  ret
+
+; ----------------------------------------------------------------------
+
+
+UpdateGrid64:
+  ld hl, oldgrid
+  ld de, newgrid64
+
+  call UpdateGrid64VeryTop
+  ld a, 14
+  ldh [RowLoop], a
+  call UpdateGrid64Middle
+  call UpdateGrid64Bottom
+  inc d
+  inc h
+
+  call UpdateGrid64Top
+  ld a, 14
+  ldh [RowLoop], a
+  call UpdateGrid64Middle
+  call UpdateGrid64Bottom
+  inc d
+  inc h
+
+  call UpdateGrid64Top
+  ld a, 14
+  ldh [RowLoop], a
+  call UpdateGrid64Middle
+  call UpdateGrid64Bottom
+  inc d
+  inc h
+
+  call UpdateGrid64Top
+  ld a, 14
+  ldh [RowLoop], a
+  call UpdateGrid64Middle
+  call UpdateGrid64VeryBottom
+
+; Copy over the old grid with the new one
+  ld hl, newgrid64
+  ld de, oldgrid
+  ld bc, 1024
+  jp memcpy
+
+UpdateGrid64Top:
+  call UpdateCellLeftEdge64Top
+  ld a, 30
+  ldh [ColumnLoop], a
+  call UpdateCellRegular64Top
+  jp UpdateCellRightEdge64Top
+
+UpdateGrid64Bottom:
+  call UpdateCellLeftEdge64Bottom
+  ld a, 30
+  ldh [ColumnLoop], a
+  call UpdateCellRegular64Bottom
+  jp UpdateCellRightEdge64Bottom
+
+UpdateGrid64VeryTop:
+  call UpdateCellLeftEdge64VeryTop
+  ld a, 30
+  ldh [ColumnLoop], a
+  call UpdateCellRegular64VeryTop
+  jp UpdateCellRightEdge64VeryTop
+
+UpdateGrid64VeryBottom:
+  call UpdateCellLeftEdge64VeryBottom
+  ld a, 30
+  ldh [ColumnLoop], a
+  call UpdateCellRegular64VeryBottom
+  jp UpdateCellRightEdge64VeryBottom
+
+UpdateGrid64Middle:
+  call UpdateCellLeftEdge64
+  ld a, 30
+  ldh [ColumnLoop], a
+  call UpdateCellRegular64
+  call UpdateCellRightEdge64
+  ldh a, [RowLoop]
+  dec a
+  ldh [RowLoop], a
+  jr nz, UpdateGrid64Middle  
+  ret
